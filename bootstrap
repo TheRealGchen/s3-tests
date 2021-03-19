@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-virtualenv="virtualenv"
+virtualenv="python3 -m venv"
 declare -a packages
 source /etc/os-release
 
@@ -59,13 +59,13 @@ esac
 
 
 # s3-tests only works on python 3.6 not newer versions of python3
-${virtualenv} --python=$(which python3.6) virtualenv
+${virtualenv} virtualenv
 
 # avoid pip bugs
 ./virtualenv/bin/pip3 install --upgrade pip
 
 # latest setuptools supporting python 2.7
-./virtualenv/bin/pip install setuptools==44.1.0
+./virtualenv/bin/pip3 install setuptools==44.1.0
 
 ./virtualenv/bin/pip3 install -r requirements.txt
 
