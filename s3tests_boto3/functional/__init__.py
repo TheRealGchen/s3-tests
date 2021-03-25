@@ -152,6 +152,8 @@ def setup():
 
     if not cfg.defaults():
         raise RuntimeError('Your config file is missing the DEFAULT section!')
+    if not cfg.has_section("cluster2"):
+        raise RuntimeError('Your config file is missing the "s3 main" section!')
     if not cfg.has_section("s3 main"):
         raise RuntimeError('Your config file is missing the "s3 main" section!')
     if not cfg.has_section("s3 alt"):
@@ -170,6 +172,14 @@ def setup():
 
     proto = 'https' if config.default_is_secure else 'http'
     config.default_endpoint = "%s://%s:%d" % (proto, config.default_host, config.default_port)
+
+    # vars from cluster2 section
+    config.second_host = cfg.get('cluster2',"host")
+    config.second_port = int(cfg.get('cluster2',"port"))
+    config.second_is_secure = cfg.getboolean('cluster2', "is_secure")
+
+    proto = 'https' if config.second_is_secure else 'http'
+    config.second_endpoint = "%s://%s:%d" % (proto, config.second_host, config.second_port)
 
     # vars from the main section
     config.main_access_key = cfg.get('s3 main',"access_key")
@@ -243,11 +253,23 @@ def check_webidentity():
     config.webidentity_token = cfg.get('webidentity', "token")
     config.webidentity_realm = cfg.get('webidentity', "KC_REALM")
 
-def get_client(client_config=None):
+def get_client(client_config=None, use_second=False):
     if client_config == None:
         client_config = Config(signature_version='s3v4')
 
-    client = boto3.client(service_name='s3',
+    client = None
+    # return second cluster 
+    if use_second:
+        client = boto3.client(service_name='s3',
+                        aws_access_key_id=config.main_access_key,
+                        aws_secret_access_key=config.main_secret_key,
+                        endpoint_url=config.second_endpoint,
+                        use_ssl=config.second_is_secure,
+                        config=client_config)
+
+    # otherwise use default cluster
+    else:
+        client = boto3.client(service_name='s3',
                         aws_access_key_id=config.main_access_key,
                         aws_secret_access_key=config.main_secret_key,
                         endpoint_url=config.default_endpoint,
@@ -264,11 +286,23 @@ def get_v2_client():
                         config=Config(signature_version='s3'))
     return client
 
-def get_sts_client(client_config=None):
+def get_sts_client(client_config=None, use_second=False):
     if client_config == None:
         client_config = Config(signature_version='s3v4')
 
-    client = boto3.client(service_name='sts',
+    client = None
+
+    if use_second:
+        client = boto3.client(service_name='sts',
+                        aws_access_key_id=config.alt_access_key,
+                        aws_secret_access_key=config.alt_secret_key,
+                        endpoint_url=config.second_endpoint,
+                        region_name='',
+                        use_ssl=config.second_is_secure,
+                        config=client_config)
+    
+    else:
+        client = boto3.client(service_name='sts',
                         aws_access_key_id=config.alt_access_key,
                         aws_secret_access_key=config.alt_secret_key,
                         endpoint_url=config.default_endpoint,
@@ -277,7 +311,7 @@ def get_sts_client(client_config=None):
                         config=client_config)
     return client
 
-def get_iam_client(client_config=None):
+def get_iam_client(client_config=None, use_second=False):
     cfg = configparser.RawConfigParser()
     try:
         path = os.environ['S3TEST_CONF']
@@ -299,7 +333,18 @@ def get_iam_client(client_config=None):
     if client_config == None:
         client_config = Config(signature_version='s3v4')
     
-    client = boto3.client(service_name='iam',
+    client = None
+    
+    if use_second:
+         client = boto3.client(service_name='iam',
+                        aws_access_key_id=config.iam_access_key,
+                        aws_secret_access_key=config.iam_secret_key,
+                        endpoint_url=config.second_endpoint,
+                        region_name='',
+                        use_ssl=config.second_is_secure,
+                        config=client_config)
+    else: 
+        client = boto3.client(service_name='iam',
                         aws_access_key_id=config.iam_access_key,
                         aws_secret_access_key=config.iam_secret_key,
                         endpoint_url=config.default_endpoint,
@@ -308,11 +353,21 @@ def get_iam_client(client_config=None):
                         config=client_config)
     return client
 
-def get_alt_client(client_config=None):
+def get_alt_client(client_config=None, use_second=False):
     if client_config == None:
         client_config = Config(signature_version='s3v4')
 
-    client = boto3.client(service_name='s3',
+    client = None
+
+    if use_second:
+            client = boto3.client(service_name='s3',
+                        aws_access_key_id=config.alt_access_key,
+                        aws_secret_access_key=config.alt_secret_key,
+                        endpoint_url=config.second_endpoint,
+                        use_ssl=config.second_is_secure,
+                        config=client_config)
+    else:
+        client = boto3.client(service_name='s3',
                         aws_access_key_id=config.alt_access_key,
                         aws_secret_access_key=config.alt_secret_key,
                         endpoint_url=config.default_endpoint,
@@ -332,6 +387,7 @@ def get_tenant_client(client_config=None):
                         config=client_config)
     return client
 
+
 def get_tenant_iam_client():
 
     client = boto3.client(service_name='iam',
@@ -342,8 +398,18 @@ def get_tenant_iam_client():
                           use_ssl=config.default_is_secure)
     return client
 
-def get_unauthenticated_client():
-    client = boto3.client(service_name='s3',
+def get_unauthenticated_client(use_second=False):
+    client = None
+
+    if use_second:
+        client = boto3.client(service_name='s3',
+                        aws_access_key_id='',
+                        aws_secret_access_key='',
+                        endpoint_url=config.second_endpoint,
+                        use_ssl=config.second_is_secure,
+                        config=Config(signature_version=UNSIGNED))
+    else:
+        client = boto3.client(service_name='s3',
                         aws_access_key_id='',
                         aws_secret_access_key='',
                         endpoint_url=config.default_endpoint,
@@ -351,8 +417,18 @@ def get_unauthenticated_client():
                         config=Config(signature_version=UNSIGNED))
     return client
 
-def get_bad_auth_client(aws_access_key_id='badauth'):
-    client = boto3.client(service_name='s3',
+def get_bad_auth_client(aws_access_key_id='badauth', use_second=False):
+    client = None
+
+    if use_second:
+        client = boto3.client(service_name='s3',
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key='roflmao',
+                        endpoint_url=config.second_endpoint,
+                        use_ssl=config.second_is_secure,
+                        config=Config(signature_version='s3v4'))
+    else:
+        client = boto3.client(service_name='s3',
                         aws_access_key_id=aws_access_key_id,
                         aws_secret_access_key='roflmao',
                         endpoint_url=config.default_endpoint,
@@ -360,11 +436,21 @@ def get_bad_auth_client(aws_access_key_id='badauth'):
                         config=Config(signature_version='s3v4'))
     return client
 
-def get_svc_client(client_config=None, svc='s3'):
+def get_svc_client(client_config=None, svc='s3', use_second=False):
     if client_config == None:
         client_config = Config(signature_version='s3v4')
 
-    client = boto3.client(service_name=svc,
+    client = None
+
+    if use_second:
+        client = boto3.client(service_name=svc,
+                        aws_access_key_id=config.main_access_key,
+                        aws_secret_access_key=config.main_secret_key,
+                        endpoint_url=config.second_endpoint,
+                        use_ssl=config.second_is_secure,
+                        config=client_config)
+    else: 
+        client = boto3.client(service_name=svc,
                         aws_access_key_id=config.main_access_key,
                         aws_secret_access_key=config.main_secret_key,
                         endpoint_url=config.default_endpoint,
@@ -388,6 +474,7 @@ def get_new_bucket_name():
         )
     return name
 
+# returns a bucket resource
 def get_new_bucket_resource(name=None):
     """
     Get a bucket that exists and is empty.
@@ -406,7 +493,32 @@ def get_new_bucket_resource(name=None):
     bucket_location = bucket.create()
     return bucket
 
-def get_new_bucket(client=None, name=None):
+# return a bucket by passing in a bucket object
+def get_same_bucket_resource(bucket, use_second=False):
+    """
+    Get a bucket that exists and is empty.
+
+    Always recreates a bucket from scratch. This is useful to also
+    reset ACLs and such.
+    """
+    endpoint_url = config.default_endpoint
+    use_ssl=config.default_is_secure
+
+    if use_second:
+        endpoint_url = config.second_endpoint
+        use_ssl=config.second_is_secure
+
+    s3 = boto3.resource('s3',
+                        aws_access_key_id=config.main_access_key,
+                        aws_secret_access_key=config.main_secret_key,
+                        endpoint_url=endpoint_url,
+                        use_ssl=use_ssl)
+    bucket = s3.Bucket(bucket.name)
+    bucket.load()
+    return bucket
+
+# returns a name which maps to a client resource
+def get_new_bucket(client=None, name=None, use_second=False):
     """
     Get a bucket that exists and is empty.
 
@@ -414,7 +526,24 @@ def get_new_bucket(client=None, name=None):
     reset ACLs and such.
     """
     if client is None:
-        client = get_client()
+        client = get_client(use_second=use_second)
+    if name is None:
+        name = get_new_bucket_name()
+
+    client.create_bucket(Bucket=name)
+    return name
+
+# TODO: write this function
+# returns a name which maps to a client resource
+def get_same_bucket(client=None, name=None, use_second=False):
+    """
+    Get a bucket that exists and is empty.
+
+    Always recreates a bucket from scratch. This is useful to also
+    reset ACLs and such.
+    """
+    if client is None:
+        client = get_client(use_second=use_second)
     if name is None:
         name = get_new_bucket_name()
 
@@ -448,6 +577,18 @@ def get_config_port():
 
 def get_config_endpoint():
     return config.default_endpoint
+
+def get_second_is_secure():
+    return config.second_is_secure
+
+def get_second_host():
+    return config.second_host
+
+def get_second_port():
+    return config.second_port
+
+def get_second_endpoint():
+    return config.second_endpoint
 
 def get_main_aws_access_key():
     return config.main_access_key
@@ -514,3 +655,4 @@ def get_token():
 
 def get_realm_name():
     return config.webidentity_realm
+

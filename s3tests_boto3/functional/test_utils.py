@@ -9,3 +9,5 @@ def test_generate():
     eq(len(''.join(utils.generate_random(FIVE_MB - 1))), FIVE_MB - 1)
     eq(len(''.join(utils.generate_random(FIVE_MB))), FIVE_MB)
     eq(len(''.join(utils.generate_random(FIVE_MB + 1))), FIVE_MB + 1)
+
+# TODO: test second cluster connections

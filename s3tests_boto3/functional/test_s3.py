@@ -28,6 +28,7 @@ import socket
 import dateutil.parser
 import ssl
 from collections import namedtuple
+from time import sleep
 
 from email.header import decode_header
 
@@ -47,6 +48,7 @@ from . import (
     get_new_bucket,
     get_new_bucket_name,
     get_new_bucket_resource,
+    get_same_bucket_resource,
     get_config_is_secure,
     get_config_host,
     get_config_port,
@@ -74,6 +76,8 @@ from . import (
     nuke_prefixed_buckets,
     )
 
+def migrate():
+    sleep(2)
 
 def _bucket_is_empty(bucket):
     is_empty = True
@@ -91,6 +95,7 @@ def test_bucket_list_empty():
     is_empty = _bucket_is_empty(bucket)
     eq(is_empty, True)
 
+@attr('multicluster')
 @attr(resource='bucket')
 @attr(method='get')
 @attr(operation='list')
@@ -101,6 +106,15 @@ def test_bucket_list_distinct():
     obj = bucket1.put_object(Body='str', Key='asdf')
     is_empty = _bucket_is_empty(bucket2)
     eq(is_empty, True)
+
+    migrate()
+
+    bucket1_2 = get_same_bucket_resource(bucket1)
+    bucket2_2 = get_same_bucket_resource(bucket2)
+    eq(bucket1, bucket1_2)
+    is_empty = _bucket_is_empty(bucket2_2)
+    eq(is_empty, True)
+
 
 def _create_objects(bucket=None, bucket_name=None, keys=[]):
     """
@@ -4099,6 +4113,7 @@ def check_invalid_bucketname(invalid_name):
 # TODO: remove this fails_on_rgw when I fix it
 @attr('fails_on_rgw')
 def test_bucket_create_naming_bad_short_empty():
+    raise SkipTest
     invalid_bucketname = ''
     status, error_code = check_invalid_bucketname(invalid_bucketname)
     eq(status, 405)
