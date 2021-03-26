@@ -475,18 +475,25 @@ def get_new_bucket_name():
     return name
 
 # returns a bucket resource
-def get_new_bucket_resource(name=None):
+def get_new_bucket_resource(name=None, use_second=False):
     """
     Get a bucket that exists and is empty.
 
     Always recreates a bucket from scratch. This is useful to also
     reset ACLs and such.
     """
+    endpoint_url = config.default_endpoint
+    use_ssl=config.default_is_secure
+
+    if use_second:
+        endpoint_url = config.second_endpoint
+        use_ssl=config.second_is_secure
+
     s3 = boto3.resource('s3',
                         aws_access_key_id=config.main_access_key,
                         aws_secret_access_key=config.main_secret_key,
-                        endpoint_url=config.default_endpoint,
-                        use_ssl=config.default_is_secure)
+                        endpoint_url=endpoint_url,
+                        use_ssl=use_ssl)
     if name is None:
         name = get_new_bucket_name()
     bucket = s3.Bucket(name)
