@@ -80,6 +80,53 @@ from . import (
 def migrate():
     sleep(1)
 
+class FakeWriteFile(FakeFile):
+    """
+    file that simulates interruptable reads of constant data
+    """
+    def __init__(self, size, char='A', interrupt=None):
+        FakeFile.__init__(self, char, interrupt)
+        self.size = size
+
+    def read(self, size=-1):
+        if size < 0:
+            size = self.size - self.offset
+        count = min(size, self.size - self.offset)
+        self.offset += count
+
+        # Sneaky! do stuff before we return (the last time)
+        if self.interrupt != None and self.offset == self.size and count > 0:
+            self.interrupt()
+
+        return self.char*count
+
+class FakeFile(object):
+    """
+    file that simulates seek, tell, and current character
+    """
+    def __init__(self, char='A', interrupt=None):
+        self.offset = 0
+        self.char = bytes(char, 'utf-8')
+        self.interrupt = interrupt
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            self.offset = offset
+        elif whence == os.SEEK_END:
+            self.offset = self.size + offset;
+        elif whence == os.SEEK_CUR:
+            self.offset += offset
+
+    def tell(self):
+        return self.offset
+
+def _get_body(response):
+    body = response['Body']
+    got = body.read()
+    if type(got) is bytes:
+        got = got.decode()
+    return got
+
 def _create_bucket_with_objects(bucket=None, bucket_name=None, keys=[], use_second=None):
     """
     Populate a (new or specified) bucket with objects with
@@ -112,6 +159,29 @@ def _bucket_is_empty(bucket):
         is_empty = False
         break
     return is_empty
+
+def add_bucket_user_grant(bucket_name, grant, client=None, use_second=False):
+    """
+    Adds a grant to the existing grants meant to be passed into
+    the AccessControlPolicy argument of put_object_acls for an object
+    owned by the main user, not the alt user
+    A grant is a dictionary in the form of:
+    {u'Grantee': {u'Type': 'type', u'DisplayName': 'name', u'ID': 'id'}, u'Permission': 'PERM'}
+    """
+    if client is None:
+        client = get_client(use_second=use_second)
+
+    main_user_id = get_main_user_id()
+    main_display_name = get_main_display_name()
+
+    response = client.get_bucket_acl(Bucket=bucket_name)
+
+    grants = response['Grants']
+    grants.append(grant)
+
+    grant = {'Grants': grants, 'Owner': {'DisplayName': main_display_name, 'ID': main_user_id}}
+
+    return grant
 
 # def test_connections():
 #     cluster1 = get_client()
@@ -378,28 +448,6 @@ def test_bucket_policy_acl():
     client1.delete_bucket_policy(Bucket=bucket_name)
     client1.put_bucket_acl(Bucket=bucket_name, ACL='public-read')
 
-def add_bucket_user_grant(bucket_name, grant, client=None, use_second=False):
-    """
-    Adds a grant to the existing grants meant to be passed into
-    the AccessControlPolicy argument of put_object_acls for an object
-    owned by the main user, not the alt user
-    A grant is a dictionary in the form of:
-    {u'Grantee': {u'Type': 'type', u'DisplayName': 'name', u'ID': 'id'}, u'Permission': 'PERM'}
-    """
-    if client is None:
-        client = get_client(use_second=use_second)
-
-    main_user_id = get_main_user_id()
-    main_display_name = get_main_display_name()
-
-    response = client.get_bucket_acl(Bucket=bucket_name)
-
-    grants = response['Grants']
-    grants.append(grant)
-
-    grant = {'Grants': grants, 'Owner': {'DisplayName': main_display_name, 'ID': main_user_id}}
-
-    return grant
 
 @attr(resource='bucket')
 @attr(method='ACLs')
@@ -724,13 +772,14 @@ def test_get_tags_acl_public():
     response = alt_client2.get_object_tagging(Bucket=bucket_name, Key=key)
     eq(response['TagSet'], input_tagset['TagSet'])
 
-def _setup_bucket_object_acl(bucket_acl, object_acl):
+def _setup_bucket_object_acl(bucket_acl, object_acl, client=None):
     """
     add a foo key, and specified key and bucket acls to
     a (new or existing) bucket. Uses main client
     """
-    bucket_name = get_new_bucket_name()
-    client = get_client()
+    if client is None:
+        client = get_client()
+    bucket_name = get_new_bucket_name(client=client)
     client.create_bucket(ACL=bucket_acl, Bucket=bucket_name)
     client.put_object(ACL=object_acl, Bucket=bucket_name, Key='foo')
 
@@ -740,8 +789,13 @@ def _setup_bucket_object_acl(bucket_acl, object_acl):
 @attr(method='get')
 @attr(operation='unauthenticated on private object')
 @attr(assertion='fails 403')
-@nose.tools.nottest
+@nose.tools.nottest('fails tests right now')
 def test_object_raw_get_object_acl():
+    '''
+    create raw object with private access and public-read ACL, test perms
+    Try to grab object from unauthed client, pre and post migration
+    Test errors are raised 
+    '''
     bucket_name = _setup_bucket_object_acl('public-read', 'private')
 
     unauthenticated_client1 = get_unauthenticated_client()
@@ -757,3 +811,255 @@ def test_object_raw_get_object_acl():
     status, error_code = _get_status_and_error_code(e.response)
     eq(status, 403)
     eq(error_code, 'AccessDenied')
+
+def check_grants(got, want):
+    """
+    Check that grants list in got matches the dictionaries in want,
+    in any order.
+    """
+    eq(len(got), len(want))
+    for g, w in zip(got, want):
+        w = dict(w)
+        g = dict(g)
+        eq(g.pop('Permission', None), w['Permission'])
+        eq(g['Grantee'].pop('DisplayName', None), w['DisplayName'])
+        eq(g['Grantee'].pop('ID', None), w['ID'])
+        eq(g['Grantee'].pop('Type', None), w['Type'])
+        eq(g['Grantee'].pop('URI', None), w['URI'])
+        eq(g['Grantee'].pop('EmailAddress', None), w['EmailAddress'])
+        eq(g, {'Grantee': {}})
+
+def _check_object_acl(permission):
+    """
+    Sets the permission on an object then checks to see
+    if it was set
+    """
+    permission = 'FULL_CONTROL'
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+
+    client1.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+
+    response = client1.get_object_acl(Bucket=bucket_name, Key='foo')
+
+    policy = {}
+    policy['Owner'] = response['Owner']
+    policy['Grants'] = response['Grants']
+    policy['Grants'][0]['Permission'] = permission
+
+    client1.put_object_acl(Bucket=bucket_name, Key='foo', AccessControlPolicy=policy)
+
+    response = client1.get_object_acl(Bucket=bucket_name, Key='foo')
+    grants = response['Grants']
+
+    main_user_id = get_main_user_id()
+    main_display_name = get_main_display_name()
+
+    check_grants(
+        grants,
+        [
+            dict(
+                Permission=permission,
+                ID=main_user_id,
+                DisplayName=main_display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ],
+        )
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+
+    response = client2.get_object_acl(Bucket=bucket_name, Key='foo')
+    grants = response['Grants']
+
+    check_grants(
+        grants,
+        [
+            dict(
+                Permission=permission,
+                ID=main_user_id,
+                DisplayName=main_display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ],
+        )
+
+
+@attr(resource='object')
+@attr(method='ACLs')
+@attr(operation='set acl FULL_CONTROL')
+@attr(assertion='reads back correctly')
+@attr('fails_on_aws') #  <Error><Code>InvalidArgument</Code><Message>Invalid id</Message><ArgumentName>CanonicalUser/ID</ArgumentName><ArgumentValue>${USER}</ArgumentValue>
+def test_object_acl_full_control():
+    '''
+    Test full control permissions and see that it works
+    '''
+
+    _check_object_acl('FULL_CONTROL')
+
+@attr(resource='object')
+@attr(method='ACLs')
+@attr(operation='set acl WRITE')
+@attr(assertion='reads back correctly')
+@attr('fails_on_aws') #  <Error><Code>InvalidArgument</Code><Message>Invalid id</Message><ArgumentName>CanonicalUser/ID</ArgumentName><ArgumentValue>${USER}</ArgumentValue>
+def test_object_acl_write():
+    '''
+    test obj write permissions and check it works
+    '''
+    _check_object_acl('WRITE')
+
+@attr(resource='object')
+@attr(method='ACLs')
+@attr(operation='set acl READ')
+@attr(assertion='reads back correctly')
+@attr('fails_on_aws') #  <Error><Code>InvalidArgument</Code><Message>Invalid id</Message><ArgumentName>CanonicalUser/ID</ArgumentName><ArgumentValue>${USER}</ArgumentValue>
+def test_object_acl_read():
+    '''
+    test obj read permissions for alt client and check it works
+    '''
+    _check_object_acl('READ')
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='get w/ If-Modified-Since: after')
+@attr(assertion='fails 304')
+def test_get_object_ifmodifiedsince_failed():
+    '''
+    test that a message does not show as modified after migration
+    create object, check modify does not show true
+    migrate and check that modify timestamp has not changed
+    '''
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    client1.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    response = client1.get_object(Bucket=bucket_name, Key='foo')
+    last_modified = str(response['LastModified'])
+
+    last_modified = last_modified.split('+')[0]
+    mtime = datetime.datetime.strptime(last_modified, '%Y-%m-%d %H:%M:%S')
+
+    after = mtime + datetime.timedelta(seconds=1)
+    after_str = time.strftime("%a, %d %b %Y %H:%M:%S GMT", after.timetuple())
+
+    time.sleep(1)
+
+    e = assert_raises(ClientError, client1.get_object, Bucket=bucket_name, Key='foo', IfModifiedSince=after_str)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 304)
+    eq(e.response['Error']['Message'], 'Not Modified')
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+    e = assert_raises(ClientError, client2.get_object, Bucket=bucket_name, Key='foo', IfModifiedSince=after_str)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 304)
+    eq(e.response['Error']['Message'], 'Not Modified')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='migrate zero sized object')
+@attr(assertion='works')
+def test_object_copy_zero_size():
+    '''
+    test an object of 0 size is migrated correctly
+    create a file in og bucket with size of 0
+    migrate over and check bucket exists and size is 0
+    '''
+    key = 'foo123bar'
+    bucket_name = _create_bucket_with_objects(keys=[key])
+    fp_a = FakeWriteFile(0, '')
+    client1 = get_client()
+    client1.put_object(Bucket=bucket_name, Key=key, Body=fp_a)
+
+    migrate(bucket_name)
+
+    client2 = get_client(use_second=True)
+    response = client2.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ContentLength'], 0)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='copy object to itself')
+@attr(assertion='fails')
+def test_object_migrate():
+    '''
+    test obj migration has same data
+    create obj, populate with sample data
+    migrate and assert data is preserved
+    '''
+    bucket_name = get_new_bucket()
+    client1 = get_client()
+    obj = 'foo123bar'
+    client1.put_object(Bucket=bucket_name, Key=obj, Body='foo')
+
+    migrate(bucket_name)
+
+    client2 = get_client(use_second=True)
+    response = client2.get_object(Bucket=bucket_name, Key=obj)
+    body = _get_body(response)
+    eq(body, 'foo')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='copy object and retain metadata')
+def test_object_copy_retaining_metadata():
+    '''
+    create metadata on objects, and test to see if it's preserved on migration
+    '''
+
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    content_type = 'audio/ogg'
+
+    obj = 'foo123bar'
+
+    metadata = {'key1': 'value1', 'key2': 'value2'}
+    client1.put_object(Bucket=bucket_name, Key=obj, Metadata=metadata, ContentType=content_type, Body=bytearray(1024 * 1024))
+
+    response = client1.get_object(Bucket=bucket_name, Key=obj)
+    eq(content_type, response['ContentType'])
+    eq(metadata, response['Metadata'])
+    body = _get_body(response)
+    eq(size, response['ContentLength'])
+
+    migrate()
+    
+    client2 = get_client(use_second=True)
+    response = client2.get_object(Bucket=bucket_name, Key=obj)
+    eq(content_type, response['ContentType'])
+    eq(metadata, response['Metadata'])
+    body = _get_body(response)
+    eq(size, response['ContentLength'])
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='copy object and retain metadata')
+def test_multiple_objects():
+    '''
+    create multiple objects 
+    assert that the contents are the same after migration
+    '''
+
+    client1 = get_client()
+    for size in [3, 1024 * 1024]:
+        bucket_name = get_new_bucket(client=client1)
+        content_type = 'audio/ogg'
+
+        metadata = {'key1': 'value1', 'key2': 'value2'}
+        client1.put_object(Bucket=bucket_name, Key='foo123bar', Metadata=metadata, ContentType=content_type, Body=bytearray(size))
+
+        copy_source = {'Bucket': bucket_name, 'Key': 'foo123bar'}
+        client.copy_object(Bucket=bucket_name, CopySource=copy_source, Key='bar321foo')
+
+        response = client.get_object(Bucket=bucket_name, Key='bar321foo')
+        eq(content_type, response['ContentType'])
+        eq(metadata, response['Metadata'])
+        body = _get_body(response)
+        eq(size, response['ContentLength'])
