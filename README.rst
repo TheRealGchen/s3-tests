@@ -71,3 +71,15 @@ You can filter tests based on the attributes. There is a attribute named ``test_
 For running ``webidentity_test`` you'll need have Keycloak running.
 
 In order to run any STS test you'll need to add "iam" section to the config file. For further reference on how your config file should look check ``s3tests.conf.SAMPLE``.
+
+========================
+ Multicluster tests
+========================
+
+Added in a separate config section for another cluster. The second cluster is for a completely differnt connection
+
+Note: this assumes that the same user is perserved accross the clusters (users have account which is valid for both cluster)
+
+Test needs at least 3 users created: main user, alt user (for permissions tests), and a tenant user (aws tenant feature)
+
+Looking into disabling tenant users
