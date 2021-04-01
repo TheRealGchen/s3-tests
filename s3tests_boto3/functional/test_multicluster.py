@@ -80,6 +80,26 @@ from . import (
 def migrate():
     sleep(1)
 
+class FakeFile(object):
+    """
+    file that simulates seek, tell, and current character
+    """
+    def __init__(self, char='A', interrupt=None):
+        self.offset = 0
+        self.char = bytes(char, 'utf-8')
+        self.interrupt = interrupt
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            self.offset = offset
+        elif whence == os.SEEK_END:
+            self.offset = self.size + offset;
+        elif whence == os.SEEK_CUR:
+            self.offset += offset
+
+    def tell(self):
+        return self.offset
+
 class FakeWriteFile(FakeFile):
     """
     file that simulates interruptable reads of constant data
@@ -100,25 +120,8 @@ class FakeWriteFile(FakeFile):
 
         return self.char*count
 
-class FakeFile(object):
-    """
-    file that simulates seek, tell, and current character
-    """
-    def __init__(self, char='A', interrupt=None):
-        self.offset = 0
-        self.char = bytes(char, 'utf-8')
-        self.interrupt = interrupt
-
-    def seek(self, offset, whence=os.SEEK_SET):
-        if whence == os.SEEK_SET:
-            self.offset = offset
-        elif whence == os.SEEK_END:
-            self.offset = self.size + offset;
-        elif whence == os.SEEK_CUR:
-            self.offset += offset
-
-    def tell(self):
-        return self.offset
+def _make_random_string(size):
+    return ''.join(random.choice(string.ascii_letters) for _ in range(size))
 
 def _get_body(response):
     body = response['Body']
@@ -789,7 +792,7 @@ def _setup_bucket_object_acl(bucket_acl, object_acl, client=None):
 @attr(method='get')
 @attr(operation='unauthenticated on private object')
 @attr(assertion='fails 403')
-@nose.tools.nottest('fails tests right now')
+@nose.tools.nottest # fails test right now
 def test_object_raw_get_object_acl():
     '''
     create raw object with private access and public-read ACL, test perms
@@ -1040,26 +1043,152 @@ def test_object_copy_retaining_metadata():
 
 @attr(resource='object')
 @attr(method='put')
-@attr(operation='copy object and retain metadata')
+@attr(operation='lots of object and retain data')
 def test_multiple_objects():
     '''
-    create multiple objects 
+    create 100 objects in a single bucket and test they migrate
+    assert that the contents are the same after migration
+    '''
+    num_objs = 100
+
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    keys = map(str, list(range(num_objs)))
+    _create_bucket_with_objects(bucket_name=bucket_name, keys=list(keys))
+
+    def check_objs(client, key):
+        response = client.get_object(Bucket=bucket_name, Key=key)
+        body = _get_body(response)
+        eq(key, body)
+
+    (check_objs(client1, key) for key in keys)
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+    (check_objs(client2, key) for key in keys)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='migrate objects with special chars in the name')
+def test_objects_special_chars():
+    '''
+    create objects with special chars in name and test they migrate
     assert that the contents are the same after migration
     '''
 
+    special_chars = list('!@#$%^(){}_')
+
     client1 = get_client()
-    for size in [3, 1024 * 1024]:
-        bucket_name = get_new_bucket(client=client1)
-        content_type = 'audio/ogg'
+    bucket_name = get_new_bucket(client=client1)
+    keys = ['random' + char + 'name' for char in special_chars]
+    _create_bucket_with_objects(bucket_name=bucket_name, keys=list(keys))
 
-        metadata = {'key1': 'value1', 'key2': 'value2'}
-        client1.put_object(Bucket=bucket_name, Key='foo123bar', Metadata=metadata, ContentType=content_type, Body=bytearray(size))
-
-        copy_source = {'Bucket': bucket_name, 'Key': 'foo123bar'}
-        client.copy_object(Bucket=bucket_name, CopySource=copy_source, Key='bar321foo')
-
-        response = client.get_object(Bucket=bucket_name, Key='bar321foo')
-        eq(content_type, response['ContentType'])
-        eq(metadata, response['Metadata'])
+    def check_objs(client, key):
+        response = client.get_object(Bucket=bucket_name, Key=key)
         body = _get_body(response)
-        eq(size, response['ContentLength'])
+        eq(key, body)
+
+    (check_objs(client1, key) for key in keys)
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+    (check_objs(client2, key) for key in keys)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='copy object to/from versioned bucket')
+@attr(assertion='works')
+@attr('versioning')
+@nose.tools.nottest # this test might not actually be fully needed 
+def test_object_copy_versioned_bucket():
+    '''
+    Test versioning system works for migrated bucket
+    migrate bucket, ensure that versioning works for copied bucket
+    '''
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    size = 1*5
+    data = bytearray(size)
+    data_str = data.decode()
+    key1 = 'foo123bar'
+    client1.put_object(Bucket=bucket_name, Key=key1, Body=data)
+
+    response = client1.get_object(Bucket=bucket_name, Key=key1)
+    version_id = response['VersionId']
+
+    # copy object in the same bucket
+    copy_source = {'Bucket': bucket_name, 'Key': key1, 'VersionId': version_id}
+    key2 = 'bar321foo'
+    client1.copy_object(Bucket=bucket_name, CopySource=copy_source, Key=key2)
+    response = client1.get_object(Bucket=bucket_name, Key=key2)
+    body = _get_body(response)
+    eq(data_str, body)
+    eq(size, response['ContentLength'])
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+
+    # second copy
+    version_id2 = response['VersionId']
+    copy_source = {'Bucket': bucket_name, 'Key': key2, 'VersionId': version_id2}
+    key3 = 'bar321foo2'
+    client2.copy_object(Bucket=bucket_name, CopySource=copy_source, Key=key3)
+    response = client2.get_object(Bucket=bucket_name, Key=key3)
+    body = _get_body(response)
+    eq(data_str, body)
+    eq(size, response['ContentLength'])
+
+    # copy to another versioned bucket
+    bucket_name2 = get_new_bucket()
+    check_configure_versioning_retry(bucket_name2, "Enabled", "Enabled")
+    copy_source = {'Bucket': bucket_name, 'Key': key1, 'VersionId': version_id}
+    key4 = 'bar321foo3'
+    client2.copy_object(Bucket=bucket_name2, CopySource=copy_source, Key=key4)
+    response = client2.get_object(Bucket=bucket_name2, Key=key4)
+    body = _get_body(response)
+    eq(data_str, body)
+    eq(size, response['ContentLength'])
+
+    # copy to another non versioned bucket
+    bucket_name3 = get_new_bucket()
+    copy_source = {'Bucket': bucket_name, 'Key': key1, 'VersionId': version_id}
+    key5 = 'bar321foo4'
+    client2.copy_object(Bucket=bucket_name3, CopySource=copy_source, Key=key5)
+    response = client2.get_object(Bucket=bucket_name3, Key=key5)
+    body = _get_body(response)
+    eq(data_str, body)
+    eq(size, response['ContentLength'])
+
+    # copy from a non versioned bucket
+    copy_source = {'Bucket': bucket_name3, 'Key': key5}
+    key6 = 'foo123bar2'
+    client2.copy_object(Bucket=bucket_name, CopySource=copy_source, Key=key6)
+    response = client2.get_object(Bucket=bucket_name, Key=key6)
+    body = _get_body(response)
+    eq(data_str, body)
+    eq(size, response['ContentLength'])
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='check multipart uploads with single small part')
+def test_multipart_upload_small():
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+
+    key1 = "mymultipart"
+    objlen = 1
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, key=key1, size=objlen)
+    response = client1.complete_multipart_upload(Bucket=bucket_name, Key=key1, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    response = client1.get_object(Bucket=bucket_name, Key=key1)
+    eq(response['ContentLength'], objlen)
+
+    migrate()
+    
+    client2 = get_client(use_second=True)
+
+    response = client1.get_object(Bucket=bucket_name, Key=key1)
+    eq(response['ContentLength'], objlen)
