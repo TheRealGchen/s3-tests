@@ -1175,6 +1175,7 @@ def test_object_copy_versioned_bucket():
 @attr(resource='object')
 @attr(method='put')
 @attr(operation='check multipart uploads with single small part')
+@attr('multipart')
 def test_multipart_upload_small():
     client1 = get_client()
     bucket_name = get_new_bucket(client=client1)
@@ -1192,3 +1193,232 @@ def test_multipart_upload_small():
 
     response = client1.get_object(Bucket=bucket_name, Key=key1)
     eq(response['ContentLength'], objlen)
+
+def generate_random(size, part_size=5*1024*1024):
+    """
+    Generate the specified number random data.
+    (actually each MB is a repetition of the first KB)
+    """
+    chunk = 1024
+    allowed = string.ascii_letters
+    for x in range(0, size, part_size):
+        strpart = ''.join([allowed[random.randint(0, len(allowed) - 1)] for _ in range(chunk)])
+        s = ''
+        left = size - x
+        this_part_size = min(left, part_size)
+        for y in range(this_part_size // chunk):
+            s = s + strpart
+        if this_part_size > len(s):
+            s = s + strpart[0:this_part_size - len(s)]
+        yield s
+        if (x == size):
+            return
+
+def _multipart_upload(bucket_name, key, size, part_size=5*1024*1024, client=None, content_type=None, metadata=None, resend_parts=[], start=0):
+    """
+    generate a multi-part upload for a random file of specifed size,
+    if requested, generate a list of the parts
+    return the upload descriptor
+    """
+    if client == None:
+        client = get_client()
+
+
+    if content_type == None and metadata == None:
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+    else:
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Metadata=metadata, ContentType=content_type)
+
+    upload_id = response['UploadId']
+    s = ''
+    parts = []
+    for i, part in enumerate(generate_random(size, part_size), start):
+        # part_num is necessary because PartNumber for upload_part
+        part_num = i+1
+        s += part
+        response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=part_num, Body=part)
+        parts.append({'ETag': response['ETag'].strip('"'), 'PartNumber': part_num})
+        if i in resend_parts:
+            client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=part_num, Body=part)
+    return (upload_id, s, parts)
+
+def _check_content_using_range(key, bucket_name, data, step, client):
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    size = response['ContentLength']
+
+    for ofs in range(0, size, step):
+        toread = size - ofs
+        if toread > step:
+            toread = step
+        end = ofs + toread - 1
+        r = 'bytes={s}-{e}'.format(s=ofs, e=end)
+        response = client.get_object(Bucket=bucket_name, Key=key, Range=r)
+        eq(response['ContentLength'], toread)
+        body = _get_body(response)
+        eq(body, data[ofs:end+1])
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='interupt middle of multipart upload with migration')
+@attr('multipart')
+@nose.tools.nottest
+# tests currently broken, will need to revisit the code
+def test_multipart_upload_migrate_interupt():
+    '''
+    Test multipart upload interupted in the middle by a migration 
+    If continue uploading after migration, ensure it is correctly uploaded
+    '''
+
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    key="mymultipart"
+    content_type='text/bla'
+    objlen = 15 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    (upload_id1, data1, parts1) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen, content_type=content_type, metadata=metadata)
+
+    # simulate stopped in the middle of uploading parts
+    migrate()
+
+    client2 = get_client(use_second=True)
+    (upload_id2, data2, parts2) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen, content_type=content_type, metadata=metadata, start=len(parts1))
+    client2.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id2, MultipartUpload={'Parts': parts1 + parts2})
+
+    response = client2.head_bucket(Bucket=bucket_name)
+    rgw_bytes_used = int(response['ResponseMetadata']['HTTPHeaders'].get('x-rgw-bytes-used', objlen*2))
+    eq(rgw_bytes_used, objlen*2)
+
+    rgw_object_count = int(response['ResponseMetadata']['HTTPHeaders'].get('x-rgw-object-count', 1))
+    eq(rgw_object_count, 1)
+
+    response = client2.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ContentType'], content_type)
+    eq(response['Metadata'], metadata)
+    body = _get_body(response)
+    total_data = data1 + data2
+    eq(len(body), response['ContentLength'])
+    eq(body, total_data)
+
+    _check_content_using_range(key, bucket_name, total_data, 1000000, client=client2)
+    _check_content_using_range(key, bucket_name, total_data, 10000000, client=client2)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='complete multiple multi-part upload with different sizes')
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='complete multi-part upload')
+@attr(assertion='successful')
+@attr('multipart')
+@nose.tools.nottest
+# tests currently broken, will need to revisit the code
+def test_multipart_upload_resend_part():
+    '''
+    test reupload of mulipart pieces after migration works
+    multipart upload, migrate before complete
+    reupload several pieces, then complete and ensure data is still good
+    '''
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    key="mymultipart"
+    objlen = 30 * 1024 * 1024
+
+    content_type = 'text/bla'
+    metadata = {'foo': 'bar'}
+    client1 = get_client()
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, client=client1, key=key, size=objlen/2, content_type=content_type, metadata=metadata)
+
+    migrate()
+
+    # split data into parts again and reupload every other
+    def reupload(client, data):
+        for i, part in enumerate(data):
+            part_num = i+1
+            if i % 2 == 0:
+                continue
+            client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=part_num, Body=part)
+
+    client2 = get_client(use_second=True)
+    # uploaded data is a complete string, split back into parts
+    chunks = [data[i:i+n] for i in range(0, len(str), len(parts))]
+    reupload(client2, chunks)
+    
+    client2.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    response = client2.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ContentType'], content_type)
+    eq(response['Metadata'], metadata)
+    body = _get_body(response)
+    eq(len(body), response['ContentLength'])
+    eq(body, data)
+
+    _check_content_using_range(key, bucket_name, data, 1000000, client=client2)
+    _check_content_using_range(key, bucket_name, data, 10000000, client=client2)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle multipart expiration')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+@attr('multipart')
+@nose.tools.nottest
+# currently failing tests on expired upload assertion. Assertion turns up both uploads are expired
+def test_lifecycle_multipart_expiration():
+    '''
+    test that assigning lifecycle policy expires correctly
+    create 2 mulitparts and assign lifecycle policy to one of them
+    migrate over, then test expiration happened correctly
+    '''
+    client1 = get_client()
+    bucket_name = get_new_bucket()
+
+    key_names = ['test1/a', 'test2/']
+
+    for key in key_names:
+        (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, client=client1, key=key, size=10)
+        # client1.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    response = client1.list_multipart_uploads(Bucket=bucket_name)
+    init_uploads = response['Uploads']
+
+    rules = [
+        {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 2}},
+    ]
+    lifecycle = {'Rules': rules}
+    response = client1.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    sleep(50)
+    migrate()
+
+    client2 = get_client(use_second=True)
+
+    response = client2.list_multipart_uploads(Bucket=bucket_name)
+    expired_uploads = response['Uploads']
+    eq(len(init_uploads), 2)
+    eq(len(expired_uploads), 1)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='get lifecycle config')
+@attr('lifecycle')
+def test_lifecycle_get():
+    '''
+    test lifecycles rules set correctly
+    set rules, migrate, assert rules carried over
+    '''
+    client1 = get_client()
+    bucket_name = get_new_bucket(client=client1)
+    rules=[{'ID': 'test1/', 'Expiration': {'Days': 31}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'ID': 'test2/', 'Expiration': {'Days': 120}, 'Prefix': 'test2/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client1.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    response = client1.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    eq(response['Rules'], rules)
+
+    migrate()
+
+    client2 = get_client(use_second=True)
+    response = client2.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    eq(response['Rules'], rules)
